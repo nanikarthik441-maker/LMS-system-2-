@@ -244,8 +244,6 @@ exports.createCourse = async (req, res, next) => {
       generateAI,
     } = req.body;
 
-    // Check for duplicate course title (case-insensitive).
-    // Deleted/archived courses are ignored.
     const existingCourse = await prisma.course.findFirst({
       where: {
         title: {
@@ -714,13 +712,14 @@ exports.deleteLesson = async (req, res, next) => {
   }
 };
 
-// @desc    Get instructor statistics
+// @desc    Get instructor statistics and metrics
 // @route   GET /api/courses/instructor/stats
-// @access  Private
+// @access  Private (Instructor/Admin)
 exports.getInstructorStats = async (req, res, next) => {
   try {
     const instructorId = req.user.id;
 
+    // Get all active courses belonging to this instructor
     const courses = await prisma.course.findMany({
       where: {
         instructorId,
@@ -728,41 +727,114 @@ exports.getInstructorStats = async (req, res, next) => {
       },
       select: {
         id: true,
-        price: true,
       },
     });
 
-    const courseIds = courses.map((c) => c.id);
+    const courseIds = courses.map((course) => course.id);
+    const totalCourses = courseIds.length;
 
-    const enrollments = await prisma.enrollment.findMany({
-      where: {
-        courseId: {
-          in: courseIds,
+    // No courses means no other metrics
+    if (courseIds.length === 0) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          totalCourses: 0,
+          totalEnrollments: 0,
+          completionRate: 0,
+          averageCourseRating: 0,
+          recentActivity: [],
         },
-      },
-      include: {
-        course: {
-          select: {
-            price: true,
+      });
+    }
+
+    const [
+      totalEnrollments,
+      completedEnrollments,
+      ratingResult,
+      recentActivity,
+    ] = await Promise.all([
+      // Total enrollments
+      prisma.enrollment.count({
+        where: {
+          courseId: {
+            in: courseIds,
           },
         },
-      },
-    });
+      }),
 
-    const totalStudents = enrollments.length;
-    const totalCourses = courses.length;
+      // Completed enrollments
+      prisma.enrollment.count({
+        where: {
+          courseId: {
+            in: courseIds,
+          },
+          status: "completed",
+        },
+      }),
 
-    const totalRevenue = enrollments.reduce(
-      (sum, enr) => sum + (enr.course?.price || 0),
-      0,
+      // Average approved review rating
+      prisma.review.aggregate({
+        where: {
+          courseId: {
+            in: courseIds,
+          },
+          status: "approved",
+        },
+        _avg: {
+          rating: true,
+        },
+      }),
+
+      // Recent course activity
+      prisma.courseActivity.findMany({
+        where: {
+          courseId: {
+            in: courseIds,
+          },
+        },
+        orderBy: {
+          createdAt: "desc",
+        },
+        take: 10,
+        select: {
+          id: true,
+          action: true,
+          details: true,
+          userId: true,
+          userName: true,
+          createdAt: true,
+          course: {
+            select: {
+              id: true,
+              title: true,
+            },
+          },
+        },
+      }),
+    ]);
+
+    const completionRate =
+      totalEnrollments > 0
+        ? Number(
+            (
+              (completedEnrollments / totalEnrollments) *
+              100
+            ).toFixed(2),
+          )
+        : 0;
+
+    const averageCourseRating = Number(
+      (ratingResult._avg.rating || 0).toFixed(2),
     );
 
     res.status(200).json({
       success: true,
       data: {
-        totalStudents,
         totalCourses,
-        totalRevenue,
+        totalEnrollments,
+        completionRate,
+        averageCourseRating,
+        recentActivity,
       },
     });
   } catch (error) {
@@ -882,7 +954,6 @@ exports.generateLessonsAI = async (req, res, next) => {
 
 exports.completeLesson = async (req, res, next) => {
   try {
-    // Read from params or body depending on where data comes from
     const courseId = req.params.courseId || req.body.courseId;
     const lessonId = req.params.lessonId || req.body.lessonId;
     const userId = req.user.id;
@@ -891,21 +962,27 @@ exports.completeLesson = async (req, res, next) => {
     const enrollment = await prisma.enrollment.findFirst({
       where: { userId, courseId },
     });
+
     if (!enrollment) {
-      return res
-        .status(403)
-        .json({ success: false, error: "Not enrolled in this course." });
+      return res.status(403).json({
+        success: false,
+        error: "Not enrolled in this course.",
+      });
     }
 
     // 2. Fetch the lesson
     const lesson = await prisma.lesson.findUnique({
       where: { id: lessonId },
     });
+
     if (!lesson) {
-      return res.status(404).json({ success: false, error: "Lesson not found." });
+      return res.status(404).json({
+        success: false,
+        error: "Lesson not found.",
+      });
     }
 
-    // 3. MAIN CHECK: Match lesson's courseId with requested courseId
+    // 3. Check that lesson belongs to course
     if (lesson.courseId !== courseId) {
       return res.status(400).json({
         success: false,
@@ -913,41 +990,67 @@ exports.completeLesson = async (req, res, next) => {
       });
     }
 
-    // 4. Mark lesson as completed (connect is idempotent) and recalc progress
+    // 4. Mark lesson as completed and recalculate progress
     const updatedEnrollment = await prisma.enrollment.update({
-      where: { userId_courseId: { userId, courseId } },
+      where: {
+        userId_courseId: {
+          userId,
+          courseId,
+        },
+      },
       data: {
         completedLessons: {
-          connect: { id: lessonId },
+          connect: {
+            id: lessonId,
+          },
         },
       },
       include: {
         completedLessons: true,
-        course: { include: { lessons: { select: { id: true } } } },
+        course: {
+          include: {
+            lessons: {
+              select: {
+                id: true,
+              },
+            },
+          },
+        },
       },
     });
 
     const totalLessons = updatedEnrollment.course.lessons.length;
+
     const newProgress =
       totalLessons > 0
         ? Math.min(
             100,
             Math.round(
-              (updatedEnrollment.completedLessons.length / totalLessons) * 100
-            )
+              (updatedEnrollment.completedLessons.length / totalLessons) * 100,
+            ),
           )
         : 0;
 
     const result = await prisma.enrollment.update({
-      where: { userId_courseId: { userId, courseId } },
+      where: {
+        userId_courseId: {
+          userId,
+          courseId,
+        },
+      },
       data: {
         progress: newProgress,
         status: newProgress === 100 ? "completed" : "active",
       },
-      include: { completedLessons: true },
+      include: {
+        completedLessons: true,
+      },
     });
 
-    return res.status(200).json({ success: true, data: result });
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
   } catch (error) {
     next(error);
   }
@@ -955,5 +1058,4 @@ exports.completeLesson = async (req, res, next) => {
 
 // @desc    Get course activity timeline
 // @route   GET /api/courses/:id/timeline
-// @access  Private
-
+// @access  Private 
